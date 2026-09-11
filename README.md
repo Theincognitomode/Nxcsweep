@@ -64,6 +64,14 @@ Pass-the-hash:
 ```bash
 ./nxcsweep.sh 10.10.10.5 -u administrator -H aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c
 ```
+Quick validity check only, no connect-command clutter:
+```bash
+./nxcsweep.sh 10.10.10.0/24 -u j.doe -p 'Summer2024!' --no-show
+```
+Local account authentication
+```bash
+./nxcsweep.sh 10.10.10.5 -u Administrator -p 'P@ssw0rd!' --local-auth
+```
 
 ## Example output
 
